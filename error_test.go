@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"strings"
@@ -131,5 +132,66 @@ func TestRecover(t *testing.T) {
 	}
 	if err := Recover(func() { panic("oops") }); err == nil || err.Error() != "panic: oops" {
 		t.Fatalf("Recover(string) = %v", err)
+	}
+}
+
+var sinkError error
+
+func BenchmarkCreate(b *testing.B) {
+	base := errors.New("not found")
+	b.Run("errors.New", func(b *testing.B) {
+		for b.Loop() {
+			sinkError = errors.New("not found")
+		}
+	})
+	b.Run("fmt.Errorf", func(b *testing.B) {
+		for b.Loop() {
+			sinkError = fmt.Errorf("find user %d: %w", 42, base)
+		}
+	})
+	b.Run("New", func(b *testing.B) {
+		for b.Loop() {
+			sinkError = New("not found")
+		}
+	})
+	b.Run("Wrap+2attrs", func(b *testing.B) {
+		for b.Loop() {
+			sinkError = Wrap(base, "find user", Code.Attr("USER_NOT_FOUND"), userID.Attr(42))
+		}
+	})
+}
+
+func BenchmarkInspect(b *testing.B) {
+	err := Wrap(Wrap(New("db", Code.Attr("X"), userID.Attr(1)), "repo"), "handler", slog.String("route", "/u"))
+	b.Run("Key.From", func(b *testing.B) {
+		for b.Loop() {
+			_, _ = userID.From(err)
+		}
+	})
+	b.Run("Attrs", func(b *testing.B) {
+		e, _ := From(err)
+		for b.Loop() {
+			_ = e.Attrs()
+		}
+	})
+	b.Run("Error", func(b *testing.B) {
+		for b.Loop() {
+			_ = err.Error()
+		}
+	})
+}
+
+func BenchmarkLog(b *testing.B) {
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	err := Wrap(New("db", Code.Attr("X")), "handler", userID.Attr(42))
+	for b.Loop() {
+		logger.Error("request failed", "err", err)
+	}
+}
+
+func TestAttrsWithoutAttributes(t *testing.T) {
+	e, _ := From(Wrap(New("x"), "y"))
+	if attrs := e.Attrs(); attrs != nil {
+		t.Fatalf("Attrs = %v, want nil", attrs)
 	}
 }

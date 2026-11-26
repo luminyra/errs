@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,7 +26,16 @@ type Error struct {
 	attrs []slog.Attr
 	time  time.Time
 	stack []uintptr
+
+	// The formatted stack trace is built on first use and cached, so logging
+	// the same error repeatedly formats its stack only once.
+	traceOnce sync.Once
+	trace     string
 }
+
+// maxInlineChain is the chain depth that chain walks handle without a heap
+// allocation; deeper chains still work, they just allocate.
+const maxInlineChain = 8
 
 // New returns an error with the given message and attributes.
 func New(msg string, attrs ...slog.Attr) error {
@@ -70,15 +80,18 @@ func Recover(fn func(), attrs ...slog.Attr) (err error) {
 // newError must be called directly by the exported function the user called,
 // so that the captured stack starts at the user's frame.
 func newError(msg string, cause error, attrs []slog.Attr) *Error {
-	pcs := make([]uintptr, maxStackDepth)
-	// Skip runtime.Callers, newError and the exported caller.
-	n := runtime.Callers(3, pcs)
+	// Capture into a stack-allocated array and keep only the frames that
+	// exist: typical stacks are 5-15 frames deep, so this allocates far less
+	// than a full maxStackDepth slice. Skip runtime.Callers, newError and the
+	// exported caller.
+	var pcs [maxStackDepth]uintptr
+	n := runtime.Callers(3, pcs[:])
 	return &Error{
 		msg:   msg,
 		cause: cause,
 		attrs: slices.Clone(attrs),
 		time:  time.Now(),
-		stack: pcs[:n:n],
+		stack: slices.Clone(pcs[:n]),
 	}
 }
 
@@ -104,23 +117,30 @@ func (e *Error) Unwrap() error {
 	return e.cause
 }
 
-// chain returns e followed by every *Error found by unwrapping, outermost
-// first.
-func (e *Error) chain() []*Error {
-	result := []*Error{e}
+// appendChain appends e and every *Error found by unwrapping, outermost
+// first. Callers pass a stack-allocated buffer, so walking a typical chain
+// does not allocate.
+func (e *Error) appendChain(dst []*Error) []*Error {
+	dst = append(dst, e)
 	for cur := e; ; {
 		next, ok := errors.AsType[*Error](cur.cause)
 		if !ok {
-			return result
+			return dst
 		}
-		result = append(result, next)
+		dst = append(dst, next)
 		cur = next
 	}
 }
 
 func (e *Error) innermost() *Error {
-	c := e.chain()
-	return c[len(c)-1]
+	cur := e
+	for {
+		next, ok := errors.AsType[*Error](cur.cause)
+		if !ok {
+			return cur
+		}
+		cur = next
+	}
 }
 
 // Attrs returns the attributes of the whole chain, merged by key, with their
@@ -128,16 +148,24 @@ func (e *Error) innermost() *Error {
 // outermost first; for a repeated key the innermost value wins, because it
 // is closest to where the error happened.
 func (e *Error) Attrs() []slog.Attr {
-	var merged []slog.Attr
-	index := make(map[string]int)
-	for _, c := range e.chain() {
+	var buf [maxInlineChain]*Error
+	chain := e.appendChain(buf[:0])
+	total := 0
+	for _, c := range chain {
+		total += len(c.attrs)
+	}
+	if total == 0 {
+		return nil
+	}
+	merged := make([]slog.Attr, 0, total)
+	for _, c := range chain {
 		for _, a := range c.attrs {
 			a.Value = a.Value.Resolve()
-			if i, ok := index[a.Key]; ok {
+			// Errors carry few attributes, so a linear scan beats a map.
+			if i := slices.IndexFunc(merged, func(m slog.Attr) bool { return m.Key == a.Key }); i >= 0 {
 				merged[i] = a
 				continue
 			}
-			index[a.Key] = len(merged)
 			merged = append(merged, a)
 		}
 	}
@@ -146,7 +174,8 @@ func (e *Error) Attrs() []slog.Attr {
 
 // lookup returns the innermost attribute with the given key.
 func (e *Error) lookup(key string) (slog.Attr, bool) {
-	for _, c := range slices.Backward(e.chain()) {
+	var buf [maxInlineChain]*Error
+	for _, c := range slices.Backward(e.appendChain(buf[:0])) {
 		for _, a := range slices.Backward(c.attrs) {
 			if a.Key == key {
 				return a, true
@@ -180,17 +209,23 @@ func (e *Error) Stack() iter.Seq[runtime.Frame] {
 }
 
 // stackTrace formats Stack as one "function\n\tfile:line" entry per frame.
+// The result is cached on the innermost error.
 func (e *Error) stackTrace() string {
-	var sb strings.Builder
-	for f := range e.Stack() {
-		sb.WriteString(f.Function)
-		sb.WriteString("\n\t")
-		sb.WriteString(f.File)
-		sb.WriteByte(':')
-		sb.WriteString(strconv.Itoa(f.Line))
-		sb.WriteByte('\n')
-	}
-	return sb.String()
+	in := e.innermost()
+	in.traceOnce.Do(func() {
+		var sb strings.Builder
+		sb.Grow(len(in.stack) * 96) // a typical frame is 60-120 bytes
+		for f := range in.Stack() {
+			sb.WriteString(f.Function)
+			sb.WriteString("\n\t")
+			sb.WriteString(f.File)
+			sb.WriteByte(':')
+			sb.WriteString(strconv.Itoa(f.Line))
+			sb.WriteByte('\n')
+		}
+		in.trace = sb.String()
+	})
+	return in.trace
 }
 
 // Format implements [fmt.Formatter]. %s and %v print the message, %q prints it
@@ -218,8 +253,10 @@ func (e *Error) Format(s fmt.State, verb rune) {
 // LogValue implements [slog.LogValuer]. It returns a group with the message,
 // the merged attributes, the time and the stack trace.
 func (e *Error) LogValue() slog.Value {
-	attrs := []slog.Attr{slog.String("message", e.Error())}
-	attrs = append(attrs, e.Attrs()...)
+	merged := e.Attrs()
+	attrs := make([]slog.Attr, 0, len(merged)+3)
+	attrs = append(attrs, slog.String("message", e.Error()))
+	attrs = append(attrs, merged...)
 	attrs = append(attrs,
 		slog.Time("time", e.Time()),
 		slog.String("stacktrace", e.stackTrace()),
